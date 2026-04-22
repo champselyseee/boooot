@@ -1,18 +1,18 @@
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, WebAppInfo, LabeledPrice, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, PreCheckoutQueryHandler, MessageHandler, filters, CallbackQueryHandler
-import sqlite3, secrets, time, asyncio
+import sqlite3, secrets, time, asyncio, os
 from aiohttp import web
-
-import os
 from dotenv import load_dotenv
+
 load_dotenv()
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 WEB_APP_URL = "https://steady-brioche-e0b7ee.netlify.app/"
+PORT = int(os.environ.get("PORT", 8080))
+
 STARS_1 = 25
 STARS_5 = 100
 STARS_MONTH = 220
 
-# ── Белый список (username без @) ──
 WHITELIST = {
     "Champselyseee",
 }
@@ -88,19 +88,16 @@ def create_token(user_id: int) -> str:
     return token
 
 def validate_token(token: str) -> bool:
-    """Проверяет токен и помечает использованным"""
+    """Проверяет токен — НЕ помечает использованным, токен живёт 30 минут"""
     con = sqlite3.connect("users.db")
     row = con.execute("SELECT used, created_at FROM tokens WHERE token = ?", (token,)).fetchone()
+    con.close()
     if not row:
-        con.close()
         return False
     used, created_at = row
-    if used or (int(time.time()) - created_at > 1800):
-        con.close()
+    # Токен живёт 30 минут, повторные проверки разрешены
+    if int(time.time()) - created_at > 1800:
         return False
-    con.execute("UPDATE tokens SET used = 1 WHERE token = ?", (token,))
-    con.commit()
-    con.close()
     return True
 
 def is_whitelisted(username: str) -> bool:
@@ -131,9 +128,7 @@ def payment_menu() -> InlineKeyboardMarkup:
     ])
 
 async def give_access(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict, is_whitelist: bool = False):
-    """Выдаёт токен и кнопку. Для подписки/вайтлиста токен не тратит проверки."""
     user_id = data["user_id"]
-
     if is_whitelist or has_subscription(data):
         token = create_token(user_id)
         sub_text = ""
@@ -145,8 +140,6 @@ async def give_access(update: Update, context: ContextTypes.DEFAULT_TYPE, data: 
             reply_markup=webapp_keyboard(token)
         )
         return
-
-    # Разовые проверки — токен расходует одну
     token = create_token(user_id)
     use_paid_check(user_id)
     remaining = data["paid_checks"] - 1
@@ -154,7 +147,6 @@ async def give_access(update: Update, context: ContextTypes.DEFAULT_TYPE, data: 
         f"✅ Осталось проверок после этой: {remaining}\n\nНажми кнопку 👇",
         reply_markup=webapp_keyboard(token)
     )
-    # Если баланс кончился — через 31 мин убираем кнопку
     if remaining == 0:
         asyncio.create_task(remove_keyboard_later(context, user_id))
 
@@ -166,17 +158,13 @@ async def remove_keyboard_later(context: ContextTypes.DEFAULT_TYPE, chat_id: int
         reply_markup=ReplyKeyboardRemove()
     )
 
-# ── /start ──
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     username = user.username or ""
     data = get_user(user.id, username)
-
     if is_whitelisted(username):
         await give_access(update, context, data, is_whitelist=True)
         return
-
-    # Бесплатная проверка
     if not data["free_used"]:
         token = create_token(user.id)
         use_free_check(user.id)
@@ -186,26 +174,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         asyncio.create_task(remove_keyboard_later(context, user.id))
         return
-
-    # Есть подписка или платные проверки
     if has_access(data):
         await give_access(update, context, data)
         return
-
-    # Нет доступа
     await update.message.reply_text(
         "🔒 Доступ закончился.\n\nВыбери способ оплаты:",
         reply_markup=payment_menu()
     )
 
-# ── /buy ──
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Выбери способ оплаты:",
-        reply_markup=payment_menu()
-    )
+    await update.message.reply_text("Выбери способ оплаты:", reply_markup=payment_menu())
 
-# ── /balance ──
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     data = get_user(user.id, user.username or "")
@@ -216,39 +195,27 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         days_left = (data["subscription_until"] - int(time.time())) // 86400
         await update.message.reply_text(f"📅 Подписка активна ещё {days_left} дн.")
         return
-    await update.message.reply_text(
-        f"📊 Проверок осталось: {data['paid_checks']}\n\nКупить ещё → /buy"
-    )
+    await update.message.reply_text(f"📊 Проверок осталось: {data['paid_checks']}\n\nКупить ещё → /buy")
 
-# ── Inline кнопки ──
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     invoices = {
         "buy_stars_1": ("1 проверка ЕГЭ", "Одна проверка по критериям ЕГЭ 2026", "stars_1", STARS_1),
         "buy_stars_5": ("5 проверок ЕГЭ", "Пять проверок по критериям ЕГЭ 2026", "stars_5", STARS_5),
         "buy_stars_month": ("Месяц безлимит", "Безлимитные проверки на 30 дней", "stars_month", STARS_MONTH),
     }
-
     if query.data in invoices:
         title, desc, payload, price = invoices[query.data]
         await context.bot.send_invoice(
             chat_id=query.message.chat_id,
-            title=title,
-            description=desc,
-            payload=payload,
-            provider_token="",
-            currency="XTR",
+            title=title, description=desc, payload=payload,
+            provider_token="", currency="XTR",
             prices=[LabeledPrice(title, price)],
         )
     elif query.data == "buy_card":
-        await query.message.reply_text(
-            "💳 Оплата картой появится совсем скоро!\n"
-            "Пока можно оплатить через Telegram Stars 💫"
-        )
+        await query.message.reply_text("💳 Оплата картой появится совсем скоро!\nПока можно оплатить через Telegram Stars 💫")
 
-# ── Оплата Stars ──
 async def pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.pre_checkout_query.answer(ok=True)
 
@@ -256,7 +223,6 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = update.effective_user.id
     payload = update.message.successful_payment.invoice_payload
     data = get_user(user_id)
-
     if payload == "stars_month":
         until = add_subscription(user_id, 30)
         from datetime import datetime
@@ -274,32 +240,40 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
         use_paid_check(user_id)
         remaining = data["paid_checks"] - 1
         await update.message.reply_text(
-            f"✅ Оплата прошла! Куплено: {count} пр.\n"
-            f"Осталось после этой: {remaining}\n\nНажми кнопку 👇",
+            f"✅ Оплата прошла! Куплено: {count} пр.\nОсталось после этой: {remaining}\n\nНажми кнопку 👇",
             reply_markup=webapp_keyboard(token)
         )
         if remaining == 0:
             asyncio.create_task(remove_keyboard_later(context, user_id))
 
-init_db()
-
-# ── HTTP сервер для проверки токенов ──
-async def check_token(request):
+# ── HTTP сервер с CORS ──
+async def check_token_handler(request):
+    # CORS заголовки
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+    }
+    if request.method == "OPTIONS":
+        return web.Response(status=200, headers=headers)
     token = request.rel_url.query.get("token", "")
     if not token:
-        return web.json_response({"ok": False}, status=400)
+        return web.json_response({"ok": False}, status=400, headers=headers)
     valid = validate_token(token)
-    return web.json_response({"ok": valid})
+    return web.json_response({"ok": valid}, headers=headers)
 
 async def run_web():
     server = web.Application()
-    server.router.add_get("/check_token", check_token)
+    server.router.add_get("/check_token", check_token_handler)
+    server.router.add_route("OPTIONS", "/check_token", check_token_handler)
     runner = web.AppRunner(server)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", 8080)
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
+    print(f"Web server started on port {PORT}")
 
 async def main():
+    init_db()
     await run_web()
     tg_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     tg_app.add_handler(CommandHandler("start", start))
