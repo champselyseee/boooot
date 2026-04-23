@@ -14,7 +14,7 @@ STARS_5 = 100
 STARS_MONTH = 220
 
 WHITELIST = {
-    "Champselyseee",
+    "riavlw",
 }
 
 # ── База данных ──
