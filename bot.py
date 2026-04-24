@@ -433,13 +433,13 @@ async def handle_proxy(request):
                 "https://api.x.ai/v1/chat/completions",
                 headers={"Content-Type": "application/json", "Authorization": f"Bearer {GROK_API_KEY}"},
                 json={
-                    "model": "grok-3",
+                    "model": "grok-4.20-reasoning-latest",
                     "messages": [
                         {"role": "system", "content": "Ты опытный преподаватель, проверяющий работы по ЕГЭ. Отвечай структурированно и по делу."},
                         {"role": "user", "content": user_content}
                     ]
                 },
-                timeout=aiohttp_client.ClientTimeout(total=180)
+                timeout=aiohttp_client.ClientTimeout(total=300)
             ) as resp:
                 if resp.status != 200:
                     err = await resp.text()
