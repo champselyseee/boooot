@@ -433,7 +433,7 @@ async def handle_proxy(request):
                 "https://api.x.ai/v1/chat/completions",
                 headers={"Content-Type": "application/json", "Authorization": f"Bearer {GROK_API_KEY}"},
                 json={
-                    "model": ""model": "grok-4.20-0309-reasoning",",
+                    "model": "grok-4.20-0309-reasoning",",
                     "messages": [
                         {"role": "system", "content": "Ты опытный преподаватель, проверяющий работы по ЕГЭ. Отвечай структурированно и по делу."},
                         {"role": "user", "content": user_content}
