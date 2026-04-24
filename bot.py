@@ -14,7 +14,14 @@ STARS_1     = 25
 STARS_5     = 100
 STARS_MONTH = 220
 
+RUB_1     = 99
+RUB_5     = 399
+RUB_MONTH = 799
+
 WHITELIST = {"riavlw"}
+
+YUKASSA_SHOP_ID = os.environ.get("YUKASSA_SHOP_ID", "")
+YUKASSA_SECRET  = os.environ.get("YUKASSA_SECRET", "")
 
 CORS_HEADERS = {
     "Access-Control-Allow-Origin":  "*",
@@ -235,12 +242,17 @@ def webapp_keyboard(token):
         [[KeyboardButton("✍️ Открыть проверку", web_app=WebAppInfo(url=f"{WEB_APP_URL}?token={token}"))]],
         resize_keyboard=True, one_time_keyboard=False)
 
-def payment_menu():
+def payment_menu(highlight=None):
+    def mark(key, text):
+        return ("✅ " if highlight == key else "") + text
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"💫 1 проверка — {STARS_1} Stars", callback_data="buy_stars_1")],
-        [InlineKeyboardButton(f"💫 5 проверок — {STARS_5} Stars", callback_data="buy_stars_5")],
-        [InlineKeyboardButton(f"💫 Месяц безлимит — {STARS_MONTH} Stars", callback_data="buy_stars_month")],
-        [InlineKeyboardButton("💳 Оплата картой (скоро)", callback_data="buy_card")],
+        [InlineKeyboardButton(mark("s1",    f"⭐ 1 проверка — {STARS_1} Stars"),      callback_data="buy_stars_1")],
+        [InlineKeyboardButton(mark("s5",    f"⭐ 5 проверок — {STARS_5} Stars"),      callback_data="buy_stars_5")],
+        [InlineKeyboardButton(mark("smon",  f"⭐ Безлимит/мес — {STARS_MONTH} Stars"), callback_data="buy_stars_month")],
+        [InlineKeyboardButton("──── или картой ────",                                  callback_data="noop")],
+        [InlineKeyboardButton(mark("r1",    f"💳 1 проверка — {RUB_1} ₽"),            callback_data="buy_rub_1")],
+        [InlineKeyboardButton(mark("r5",    f"💳 5 проверок — {RUB_5} ₽"),            callback_data="buy_rub_5")],
+        [InlineKeyboardButton(mark("rmon",  f"💳 Безлимит/мес — {RUB_MONTH} ₽"),     callback_data="buy_rub_month")],
     ])
 
 async def give_access(update, context, data, is_whitelist=False):
@@ -306,8 +318,48 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title, desc, payload, price = invoices[query.data]
         await context.bot.send_invoice(chat_id=query.message.chat_id, title=title, description=desc,
             payload=payload, provider_token="", currency="XTR", prices=[LabeledPrice(title, price)])
-    elif query.data == "buy_card":
-        await query.message.reply_text("💳 Оплата картой появится совсем скоро!\nПока можно оплатить через Telegram Stars 💫")
+    elif query.data == "noop":
+        return
+
+    elif query.data in ("buy_rub_1", "buy_rub_5", "buy_rub_month"):
+        rub_map = {
+            "buy_rub_1":     ("r1",   "1 проверка — 99 руб",      RUB_1,   "rub_1"),
+            "buy_rub_5":     ("r5",   "5 проверок — 399 руб",     RUB_5,   "rub_5"),
+            "buy_rub_month": ("rmon", "Безлимит/мес — 799 руб",   RUB_MONTH, "rub_month"),
+        }
+        key, label, amount, pl = rub_map[query.data]
+
+        if not YUKASSA_SHOP_ID or not YUKASSA_SECRET:
+            await query.message.reply_text(
+                "💳 Выбран тариф: " + label + "\n\nОплата картой скоро будет доступна!\nПока можно оплатить через Telegram Stars ⭐",
+                reply_markup=payment_menu(highlight=key)
+            )
+            return
+
+        import aiohttp as _h, uuid
+        async with _h.ClientSession() as s:
+            async with s.post(
+                "https://api.yookassa.ru/v3/payments",
+                auth=_h.BasicAuth(YUKASSA_SHOP_ID, YUKASSA_SECRET),
+                headers={"Idempotence-Key": str(uuid.uuid4()), "Content-Type": "application/json"},
+                json={
+                    "amount": {"value": str(amount) + ".00", "currency": "RUB"},
+                    "confirmation": {"type": "redirect", "return_url": "https://t.me/"},
+                    "capture": True,
+                    "description": label,
+                    "metadata": {"user_id": str(query.from_user.id), "payload": pl}
+                }
+            ) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    pay_url = d["confirmation"]["confirmation_url"]
+                    await query.message.reply_text(
+                        "💳 " + label,
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Оплатить картой", url=pay_url)]])
+                    )
+                else:
+                    err = await r.text()
+                    await query.message.reply_text("❌ Ошибка: " + err[:200])
 
 async def pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.pre_checkout_query.answer(ok=True)
@@ -368,38 +420,62 @@ async def handle_proxy(request):
     # Формируем сообщение для xAI
     if photo:
         user_content = [
-            {"type": "input_image", "image_url": photo},
-            {"type": "input_text",  "text": "Вот фото задания.\n\n" + prompt + text}
+            {"type": "image_url", "image_url": {"url": photo}},
+            {"type": "text", "text": "Вот фото задания.\n\n" + prompt + text}
         ]
     else:
-        user_content = [{"type": "input_text", "text": prompt + text}]
+        user_content = prompt + text
 
     import aiohttp as aiohttp_client
     try:
         async with aiohttp_client.ClientSession() as session:
             async with session.post(
-                "https://api.x.ai/v1/responses",
+                "https://api.x.ai/v1/chat/completions",
                 headers={"Content-Type": "application/json", "Authorization": f"Bearer {GROK_API_KEY}"},
                 json={
-                    "model": "grok-4.20-reasoning",
-                    "input": [
+                    "model": "grok-3",
+                    "messages": [
                         {"role": "system", "content": "Ты опытный преподаватель, проверяющий работы по ЕГЭ. Отвечай структурированно и по делу."},
-                        {"role": "user",   "content": user_content}
+                        {"role": "user", "content": user_content}
                     ]
                 },
-                timeout=aiohttp_client.ClientTimeout(total=300)
+                timeout=aiohttp_client.ClientTimeout(total=180)
             ) as resp:
                 if resp.status != 200:
                     err = await resp.text()
-                    return web.json_response({"error": f"xAI error: {err[:300]}"}, status=502, headers=CORS_HEADERS)
+                    return web.json_response({"error": f"xAI error: {err[:200]}"}, status=502, headers=CORS_HEADERS)
                 data = await resp.json()
-                message = next((o for o in data.get("output", []) if o.get("type") == "message"), None)
-                if not message:
-                    return web.json_response({"error": "no message in response"}, status=502, headers=CORS_HEADERS)
-                answer = next((c["text"] for c in message.get("content", []) if c.get("type") == "output_text"), "")
+                answer = data["choices"][0]["message"]["content"]
                 return web.json_response({"answer": answer}, headers=CORS_HEADERS)
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500, headers=CORS_HEADERS)
+
+async def handle_yukassa_webhook(request):
+    try:
+        body = await request.json()
+    except Exception:
+        return web.Response(status=400)
+    if body.get("event") != "payment.succeeded":
+        return web.Response(status=200)
+    meta    = body.get("object", {}).get("metadata", {})
+    user_id = int(meta.get("user_id", 0))
+    pl      = meta.get("payload", "")
+    if not user_id or not pl:
+        return web.Response(status=200)
+    from telegram import Bot
+    bot = Bot(token=TELEGRAM_TOKEN)
+    if pl == "rub_month":
+        add_subscription(user_id, 30)
+        token = create_token(user_id)
+        await bot.send_message(chat_id=user_id, text="✅ Оплата прошла! Безлимит на 30 дней активирован. Нажми кнопку 👇", reply_markup=webapp_keyboard(token))
+    else:
+        count = 5 if pl == "rub_5" else 1
+        add_paid_checks(user_id, count)
+        token = create_token(user_id)
+        use_paid_check(user_id)
+        remaining = get_user(user_id)["paid_checks"] - 1
+        await bot.send_message(chat_id=user_id, text="✅ Оплата прошла! Куплено " + str(count) + " пр. Осталось: " + str(remaining) + " Нажми кнопку 👇", reply_markup=webapp_keyboard(token))
+    return web.Response(status=200)
 
 async def run_web():
     app = web.Application()
@@ -407,6 +483,7 @@ async def run_web():
     app.router.add_route("OPTIONS", "/check_token", handle_check_token)
     app.router.add_post("/proxy", handle_proxy)
     app.router.add_route("OPTIONS", "/proxy", handle_proxy)
+    app.router.add_post("/yukassa/webhook", handle_yukassa_webhook)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
