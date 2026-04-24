@@ -323,9 +323,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data in ("buy_rub_1", "buy_rub_5", "buy_rub_month"):
         rub_map = {
-            "buy_rub_1":     ("r1",   "1 проверка — 99 руб",      RUB_1,   "rub_1"),
-            "buy_rub_5":     ("r5",   "5 проверок — 399 руб",     RUB_5,   "rub_5"),
-            "buy_rub_month": ("rmon", "Безлимит/мес — 799 руб",   RUB_MONTH, "rub_month"),
+            "buy_rub_1":     ("r1",   "1 проверка — 27 руб",      RUB_1,   "rub_1"),
+            "buy_rub_5":     ("r5",   "5 проверок — 110 руб",     RUB_5,   "rub_5"),
+            "buy_rub_month": ("rmon", "Безлимит/мес — 230 руб",   RUB_MONTH, "rub_month"),
         }
         key, label, amount, pl = rub_map[query.data]
 
