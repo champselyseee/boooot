@@ -14,9 +14,9 @@ STARS_1     = 25
 STARS_5     = 100
 STARS_MONTH = 220
 
-RUB_1     = 99
-RUB_5     = 399
-RUB_MONTH = 799
+RUB_1     = 27
+RUB_5     = 110
+RUB_MONTH = 210
 
 WHITELIST = {"riavlw"}
 
