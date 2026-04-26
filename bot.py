@@ -19,7 +19,7 @@ RUB_1     = 27
 RUB_5     = 110
 RUB_MONTH = 210
 
-WHITELIST = {"champselyseee"}
+WHITELIST = {"champselyseee","riavlw"}
 
 YUKASSA_SHOP_ID = os.environ.get("YUKASSA_SHOP_ID", "")
 YUKASSA_SECRET  = os.environ.get("YUKASSA_SECRET", "")
