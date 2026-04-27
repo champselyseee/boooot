@@ -19,7 +19,7 @@ RUB_1     = 27
 RUB_5     = 110
 RUB_MONTH = 210
 
-WHITELIST = {"champselyseee", "riavlw"}
+WHITELIST = {"champselyseee","riavlw"}
 
 YUKASSA_SHOP_ID = os.environ.get("YUKASSA_SHOP_ID", "")
 YUKASSA_SECRET  = os.environ.get("YUKASSA_SECRET", "")
@@ -174,55 +174,17 @@ def init_db():
     con.execute("""CREATE TABLE IF NOT EXISTS tokens (
         token TEXT PRIMARY KEY, user_id INTEGER,
         created_at INTEGER, used INTEGER DEFAULT 0)""")
-    con.execute("""CREATE TABLE IF NOT EXISTS referrals (
-        referrer_id INTEGER, referred_id INTEGER PRIMARY KEY,
-        created_at INTEGER, rewarded INTEGER DEFAULT 0)""")
-    try:
-        con.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER DEFAULT NULL")
-    except sqlite3.OperationalError:
-        pass
     con.commit(); con.close()
 
 def get_user(user_id, username=None):
     con = sqlite3.connect(DB_PATH)
     row = con.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
     if not row:
-        con.execute("INSERT INTO users VALUES (?,?,0,0,0,NULL)", (user_id, username))
+        con.execute("INSERT INTO users VALUES (?,?,0,0,0)", (user_id, username))
         con.commit()
         row = con.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
     con.close()
     return {"user_id":row[0],"username":row[1],"free_used":row[2],"paid_checks":row[3],"subscription_until":row[4]}
-
-
-def set_referrer(referred_id, referrer_id):
-    if referred_id == referrer_id:
-        return
-    con = sqlite3.connect(DB_PATH)
-    exists = con.execute("SELECT 1 FROM referrals WHERE referred_id=?", (referred_id,)).fetchone()
-    if not exists:
-        con.execute("INSERT INTO referrals VALUES (?,?,?,0)", (referrer_id, referred_id, int(time.time())))
-        con.execute("UPDATE users SET referred_by=? WHERE user_id=?", (referrer_id, referred_id))
-        con.commit()
-    con.close()
-
-def reward_referrer(referred_id):
-    con = sqlite3.connect(DB_PATH)
-    row = con.execute("SELECT referrer_id, rewarded FROM referrals WHERE referred_id=?", (referred_id,)).fetchone()
-    if not row or row[1]:
-        con.close(); return None
-    referrer_id = row[0]
-    con.execute("UPDATE referrals SET rewarded=1 WHERE referred_id=?", (referred_id,))
-    con.execute("UPDATE users SET paid_checks=paid_checks+1 WHERE user_id=?", (referrer_id,))
-    con.commit()
-    con.close()
-    return referrer_id
-
-def get_referral_stats(user_id):
-    con = sqlite3.connect(DB_PATH)
-    total = con.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=?", (user_id,)).fetchone()[0]
-    rewarded = con.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND rewarded=1", (user_id,)).fetchone()[0]
-    con.close()
-    return total, rewarded
 
 def use_free_check(user_id):
     con = sqlite3.connect(DB_PATH)
@@ -326,15 +288,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     username = user.username or ""
     data = get_user(user.id, username)
-    if context.args:
-        arg = context.args[0]
-        if arg.startswith("ref_"):
-            try:
-                referrer_id = int(arg[4:])
-                if not data["free_used"]:
-                    set_referrer(user.id, referrer_id)
-            except ValueError:
-                pass
     if is_whitelisted(username):
         await give_access(update, context, data, is_whitelist=True); return
     if not data["free_used"]:
@@ -359,22 +312,6 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"📅 Подписка активна ещё {days_left} дн."); return
     await update.message.reply_text(f"📊 Проверок осталось: {data['paid_checks']}\n\nКупить ещё → /buy")
 
-async def ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    bot_info = await context.bot.get_me()
-    link = f"https://t.me/{bot_info.username}?start=ref_{user.id}"
-    total, rewarded = get_referral_stats(user.id)
-    await update.message.reply_text(
-        f"👥 Твоя реферальная ссылка:\n{link}\n\n"
-        f"За каждого друга, который купит проверку — ты получишь 1 бесплатную проверку!\n\n"
-        f"📊 Статистика:\n"
-        f"Приглашено: {total}\n"
-        f"Купили (бонусов получено): {rewarded}"
-    )
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("По всем вопросам и проблемам пиши: @champselyseee")
-
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -394,7 +331,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rub_map = {
             "buy_rub_1":     ("r1",   "1 проверка — 27 руб",      RUB_1,   "rub_1"),
             "buy_rub_5":     ("r5",   "5 проверок — 110 руб",     RUB_5,   "rub_5"),
-            "buy_rub_month": ("rmon", "Безлимит/мес — 210 руб",   RUB_MONTH, "rub_month"),
+            "buy_rub_month": ("rmon", "Безлимит/мес — 230 руб",   RUB_MONTH, "rub_month"),
         }
         key, label, amount, pl = rub_map[query.data]
 
@@ -436,12 +373,6 @@ async def pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     payload = update.message.successful_payment.invoice_payload
-    referrer_id = reward_referrer(user_id)
-    if referrer_id:
-        try:
-            await context.bot.send_message(chat_id=referrer_id, text="🎉 Твой друг купил проверку! Тебе начислена 1 бесплатная проверка.\n\nПроверь баланс → /balance")
-        except Exception:
-            pass
     if payload == "stars_month":
         until = add_subscription(user_id, 30)
         from datetime import datetime
@@ -461,6 +392,18 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
             reply_markup=webapp_keyboard(token))
         if remaining == 0:
             asyncio.create_task(remove_keyboard_later(context, user_id))
+
+async def _send_ref_reminder(user_id):
+    """Отправляет напоминание про реферальную программу после платной проверки."""
+    try:
+        from telegram import Bot
+        bot = Bot(token=TELEGRAM_TOKEN)
+        await bot.send_message(
+            chat_id=user_id,
+            text="👥 Понравился бот? Пригласи друга и получи бесплатную проверку!\n\nТвоя реферальная ссылка → /ref"
+        )
+    except Exception:
+        pass
 
 # ── HTTP эндпоинты ──
 async def handle_check_token(request):
@@ -522,6 +465,8 @@ async def handle_proxy(request):
                         return web.json_response({"error": f"xAI error: {err[:200]}"}, status=502, headers=CORS_HEADERS)
                     data = await resp.json()
                     answer = data["choices"][0]["message"]["content"]
+                    # Напоминалка про реферальную программу после платной проверки
+                    asyncio.create_task(_send_ref_reminder(user_id))
                     return web.json_response({"answer": answer}, headers=CORS_HEADERS)
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500, headers=CORS_HEADERS)
@@ -540,12 +485,6 @@ async def handle_yukassa_webhook(request):
         return web.Response(status=200)
     from telegram import Bot
     bot = Bot(token=TELEGRAM_TOKEN)
-    referrer_id = reward_referrer(user_id)
-    if referrer_id:
-        try:
-            await bot.send_message(chat_id=referrer_id, text="🎉 Твой друг купил проверку! Тебе начислена 1 бесплатная проверка.\n\nПроверь баланс → /balance")
-        except Exception:
-            pass
     if pl == "rub_month":
         add_subscription(user_id, 30)
         token = create_token(user_id)
@@ -578,8 +517,6 @@ async def main():
     tg_app.add_handler(CommandHandler("start", start))
     tg_app.add_handler(CommandHandler("buy", buy))
     tg_app.add_handler(CommandHandler("balance", balance))
-    tg_app.add_handler(CommandHandler("ref", ref))
-    tg_app.add_handler(CommandHandler("help", help_cmd))
     tg_app.add_handler(CallbackQueryHandler(handle_callback))
     tg_app.add_handler(PreCheckoutQueryHandler(pre_checkout))
     tg_app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
