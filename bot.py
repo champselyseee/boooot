@@ -330,6 +330,29 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"📅 Подписка активна ещё {days_left} дн."); return
     await update.message.reply_text(f"📊 Проверок осталось: {data['paid_checks']}\n\nКупить ещё → /buy")
 
+async def ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    bot_info = await context.bot.get_me()
+    link = f"https://t.me/{bot_info.username}?start=ref_{user.id}"
+    total, rewarded = 0, 0
+    try:
+        con = sqlite3.connect(DB_PATH)
+        total = con.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=?", (user.id,)).fetchone()[0]
+        rewarded = con.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND rewarded=1", (user.id,)).fetchone()[0]
+        con.close()
+    except Exception:
+        pass
+    await update.message.reply_text(
+        f"👥 Твоя реферальная ссылка:\n{link}\n\n"
+        f"За каждого друга, который купит проверку — ты получишь 1 бесплатную проверку!\n\n"
+        f"📊 Статистика:\n"
+        f"Приглашено: {total}\n"
+        f"Купили (бонусов получено): {rewarded}"
+    )
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("По всем вопросам и проблемам пиши: @champselyseee")
+
 async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     rows = get_history(user.id, limit=5)
@@ -551,6 +574,8 @@ async def main():
     tg_app.add_handler(CommandHandler("buy", buy))
     tg_app.add_handler(CommandHandler("balance", balance))
     tg_app.add_handler(CommandHandler("history", history_cmd))
+    tg_app.add_handler(CommandHandler("ref", ref))
+    tg_app.add_handler(CommandHandler("help", help_cmd))
     tg_app.add_handler(CallbackQueryHandler(handle_callback))
     tg_app.add_handler(PreCheckoutQueryHandler(pre_checkout))
     tg_app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
