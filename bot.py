@@ -19,7 +19,7 @@ RUB_1     = 27
 RUB_5     = 110
 RUB_MONTH = 210
 
-WHITELIST = {"champselyseee"}
+WHITELIST = {"champselyseee", "riavlw"}
 
 YUKASSA_SHOP_ID = os.environ.get("YUKASSA_SHOP_ID", "")
 YUKASSA_SECRET  = os.environ.get("YUKASSA_SECRET", "")
@@ -174,6 +174,10 @@ def init_db():
     con.execute("""CREATE TABLE IF NOT EXISTS tokens (
         token TEXT PRIMARY KEY, user_id INTEGER,
         created_at INTEGER, used INTEGER DEFAULT 0)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER, work_type TEXT,
+        result TEXT, created_at INTEGER)""")
     con.commit(); con.close()
 
 def get_user(user_id, username=None):
@@ -185,6 +189,20 @@ def get_user(user_id, username=None):
         row = con.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
     con.close()
     return {"user_id":row[0],"username":row[1],"free_used":row[2],"paid_checks":row[3],"subscription_until":row[4]}
+
+def save_history(user_id, work_type, result):
+    con = sqlite3.connect(DB_PATH)
+    con.execute("INSERT INTO history (user_id, work_type, result, created_at) VALUES (?,?,?,?)",
+        (user_id, work_type, result[:500], int(time.time())))
+    con.commit(); con.close()
+
+def get_history(user_id, limit=5):
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute(
+        "SELECT work_type, result, created_at FROM history WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+        (user_id, limit)).fetchall()
+    con.close()
+    return rows
 
 def use_free_check(user_id):
     con = sqlite3.connect(DB_PATH)
@@ -312,6 +330,22 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"📅 Подписка активна ещё {days_left} дн."); return
     await update.message.reply_text(f"📊 Проверок осталось: {data['paid_checks']}\n\nКупить ещё → /buy")
 
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    rows = get_history(user.id, limit=5)
+    if not rows:
+        await update.message.reply_text("📭 У тебя ещё нет сохранённых проверок.")
+        return
+    from datetime import datetime
+    type_names = {"email": "Письмо (37)", "essay": "Эссе (38)", "composition": "Сочинение (рус)"}
+    text = "📋 Твои последние проверки:\n\n"
+    for i, (work_type, result, created_at) in enumerate(rows, 1):
+        dt = datetime.fromtimestamp(created_at).strftime("%d.%m %H:%M")
+        tname = type_names.get(work_type, work_type)
+        preview = "\n".join(result.splitlines()[:2])[:120]
+        text += f"{i}. {tname} — {dt}\n{preview}\n\n"
+    await update.message.reply_text(text)
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -394,7 +428,6 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
             asyncio.create_task(remove_keyboard_later(context, user_id))
 
 async def _send_ref_reminder(user_id):
-    """Отправляет напоминание про реферальную программу после платной проверки."""
     try:
         from telegram import Bot
         bot = Bot(token=TELEGRAM_TOKEN)
@@ -465,7 +498,7 @@ async def handle_proxy(request):
                         return web.json_response({"error": f"xAI error: {err[:200]}"}, status=502, headers=CORS_HEADERS)
                     data = await resp.json()
                     answer = data["choices"][0]["message"]["content"]
-                    # Напоминалка про реферальную программу после платной проверки
+                    save_history(user_id, work_type, answer)
                     asyncio.create_task(_send_ref_reminder(user_id))
                     return web.json_response({"answer": answer}, headers=CORS_HEADERS)
     except Exception as e:
@@ -517,6 +550,7 @@ async def main():
     tg_app.add_handler(CommandHandler("start", start))
     tg_app.add_handler(CommandHandler("buy", buy))
     tg_app.add_handler(CommandHandler("balance", balance))
+    tg_app.add_handler(CommandHandler("history", history_cmd))
     tg_app.add_handler(CallbackQueryHandler(handle_callback))
     tg_app.add_handler(PreCheckoutQueryHandler(pre_checkout))
     tg_app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
