@@ -193,7 +193,7 @@ def get_user(user_id, username=None):
 def save_history(user_id, work_type, result):
     con = sqlite3.connect(DB_PATH)
     con.execute("INSERT INTO history (user_id, work_type, result, created_at) VALUES (?,?,?,?)",
-        (user_id, work_type, result[:500], int(time.time())))
+        (user_id, work_type, result[:3000], int(time.time())))
     con.commit(); con.close()
 
 def get_history(user_id, limit=5):
@@ -365,7 +365,15 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, (work_type, result, created_at) in enumerate(rows, 1):
         dt = datetime.fromtimestamp(created_at).strftime("%d.%m %H:%M")
         tname = type_names.get(work_type, work_type)
-        preview = "\n".join(result.splitlines()[:2])[:120]
+        # Ищем строку с итоговым баллом
+        import re as _re
+        preview = ""
+        for line in result.splitlines():
+            if _re.search(r"(ИТОГ|итог|\d+\s*/\s*\d+|\d+\s+баллов)", line):
+                preview = line.strip()[:120]
+                break
+        if not preview:
+            preview = result.splitlines()[0][:120] if result else ""
         text += f"{i}. {tname} — {dt}\n{preview}\n\n"
     await update.message.reply_text(text)
 
