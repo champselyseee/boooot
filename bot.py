@@ -178,17 +178,48 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER, work_type TEXT,
         result TEXT, created_at INTEGER)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS referrals (
+        referrer_id INTEGER, referred_id INTEGER PRIMARY KEY,
+        created_at INTEGER, rewarded INTEGER DEFAULT 0)""")
+    # Миграции для старых БД
+    try:
+        con.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER DEFAULT NULL")
+    except sqlite3.OperationalError:
+        pass
     con.commit(); con.close()
 
 def get_user(user_id, username=None):
     con = sqlite3.connect(DB_PATH)
     row = con.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
     if not row:
-        con.execute("INSERT INTO users VALUES (?,?,0,0,0)", (user_id, username))
+        con.execute("INSERT INTO users VALUES (?,?,0,0,0,NULL)", (user_id, username))
         con.commit()
         row = con.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
     con.close()
     return {"user_id":row[0],"username":row[1],"free_used":row[2],"paid_checks":row[3],"subscription_until":row[4]}
+
+def set_referrer(referred_id, referrer_id):
+    if referred_id == referrer_id:
+        return
+    con = sqlite3.connect(DB_PATH)
+    exists = con.execute("SELECT 1 FROM referrals WHERE referred_id=?", (referred_id,)).fetchone()
+    if not exists:
+        con.execute("INSERT INTO referrals VALUES (?,?,?,0)", (referrer_id, referred_id, int(time.time())))
+        con.execute("UPDATE users SET referred_by=? WHERE user_id=?", (referrer_id, referred_id))
+        con.commit()
+    con.close()
+
+def reward_referrer(referred_id):
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute("SELECT referrer_id, rewarded FROM referrals WHERE referred_id=?", (referred_id,)).fetchone()
+    if not row or row[1]:
+        con.close(); return None
+    referrer_id = row[0]
+    con.execute("UPDATE referrals SET rewarded=1 WHERE referred_id=?", (referred_id,))
+    con.execute("UPDATE users SET paid_checks=paid_checks+1 WHERE user_id=?", (referrer_id,))
+    con.commit()
+    con.close()
+    return referrer_id
 
 def save_history(user_id, work_type, result):
     con = sqlite3.connect(DB_PATH)
@@ -306,6 +337,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     username = user.username or ""
     data = get_user(user.id, username)
+    if context.args:
+        arg = context.args[0]
+        if arg.startswith("ref_"):
+            try:
+                referrer_id = int(arg[4:])
+                if not data["free_used"]:
+                    set_referrer(user.id, referrer_id)
+            except ValueError:
+                pass
     if is_whitelisted(username):
         await give_access(update, context, data, is_whitelist=True); return
     if not data["free_used"]:
@@ -438,6 +478,12 @@ async def pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     payload = update.message.successful_payment.invoice_payload
+    referrer_id = reward_referrer(user_id)
+    if referrer_id:
+        try:
+            await context.bot.send_message(chat_id=referrer_id, text="🎉 Твой друг купил проверку! Тебе начислена 1 бесплатная проверка.\n\nПроверь баланс → /balance")
+        except Exception:
+            pass
     if payload == "stars_month":
         until = add_subscription(user_id, 30)
         from datetime import datetime
@@ -549,6 +595,12 @@ async def handle_yukassa_webhook(request):
         return web.Response(status=200)
     from telegram import Bot
     bot = Bot(token=TELEGRAM_TOKEN)
+    referrer_id = reward_referrer(user_id)
+    if referrer_id:
+        try:
+            await bot.send_message(chat_id=referrer_id, text="🎉 Твой друг купил проверку! Тебе начислена 1 бесплатная проверка.\n\nПроверь баланс → /balance")
+        except Exception:
+            pass
     if pl == "rub_month":
         add_subscription(user_id, 30)
         token = create_token(user_id)
