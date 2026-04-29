@@ -19,7 +19,7 @@ RUB_1     = 27
 RUB_5     = 110
 RUB_MONTH = 210
 
-WHITELIST = {"champselyseee", "riavlw", "ENOTINA0"}
+WHITELIST = {"champselyseee", "riavlw", "dilaiip", "ENOTINA0"}
 
 YUKASSA_SHOP_ID = os.environ.get("YUKASSA_SHOP_ID", "")
 YUKASSA_SECRET  = os.environ.get("YUKASSA_SECRET", "")
@@ -234,6 +234,22 @@ def validate_token(token):
     used, created_at = row
     return not used and (int(time.time()) - created_at <= 1800)
 
+def get_user_by_token(token):
+    """Проверяет токен и возвращает user_id, не сжигая его."""
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute("SELECT user_id, used, created_at FROM tokens WHERE token=?", (token,)).fetchone()
+    con.close()
+    if not row: return None
+    user_id, used, created_at = row
+    if used or (int(time.time()) - created_at > 1800): return None
+    return user_id
+
+def burn_token(token):
+    """Сжигает токен."""
+    con = sqlite3.connect(DB_PATH)
+    con.execute("UPDATE tokens SET used=1 WHERE token=?", (token,))
+    con.commit(); con.close()
+
 def is_whitelisted(username):
     return bool(username) and username.lower() in {w.lower() for w in WHITELIST}
 
@@ -417,8 +433,8 @@ async def handle_proxy(request):
     text = body.get("text", "")
     photo = body.get("photo")  # base64 или null
 
-    # Сжигаем токен — с этого момента он недействителен
-    user_id = consume_token(token)
+    # Проверяем токен без сжигания — сожжём только при успехе
+    user_id = get_user_by_token(token)
     if not user_id:
         return web.json_response({"error": "invalid_token"}, status=403, headers=CORS_HEADERS)
 
@@ -456,6 +472,9 @@ async def handle_proxy(request):
                         return web.json_response({"error": f"xAI error: {err[:200]}"}, status=502, headers=CORS_HEADERS)
                     data = await resp.json()
                     answer = data["choices"][0]["message"]["content"]
+                    burn_token(token)
+                    save_history(user_id, work_type, answer)
+                    asyncio.create_task(_send_ref_reminder(user_id))
                     return web.json_response({"answer": answer}, headers=CORS_HEADERS)
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500, headers=CORS_HEADERS)
