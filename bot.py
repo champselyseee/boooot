@@ -567,6 +567,96 @@ async def handle_check_token(request):
     valid = validate_token(token) if token else False
     return web.json_response({"ok": valid}, headers=CORS_HEADERS)
 
+
+def _decode_data_url(data_url):
+    """Возвращает (mime, bytes) из data URL."""
+    import base64
+    if not isinstance(data_url, str) or ',' not in data_url:
+        raise ValueError('Некорректный файл')
+    header, b64 = data_url.split(',', 1)
+    mime = 'application/octet-stream'
+    if header.startswith('data:'):
+        mime = header[5:].split(';', 1)[0] or mime
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except Exception:
+        raise ValueError('Не удалось прочитать файл')
+    return mime, raw
+
+
+def _extract_docx_text(raw):
+    import io, zipfile, xml.etree.ElementTree as ET
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            xml = z.read('word/document.xml')
+    except Exception:
+        raise ValueError('Не удалось прочитать DOCX-файл')
+    root = ET.fromstring(xml)
+    ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+    paragraphs = []
+    for p in root.findall('.//w:p', ns):
+        parts = [t.text for t in p.findall('.//w:t', ns) if t.text]
+        if parts:
+            paragraphs.append(''.join(parts))
+    return '\n'.join(paragraphs).strip()
+
+
+def _extract_pdf_text(raw):
+    import io
+    reader_cls = None
+    try:
+        from pypdf import PdfReader
+        reader_cls = PdfReader
+    except Exception:
+        try:
+            from PyPDF2 import PdfReader
+            reader_cls = PdfReader
+        except Exception:
+            raise ValueError('PDF-файлы требуют установленный пакет pypdf или PyPDF2 на сервере')
+    try:
+        reader = reader_cls(io.BytesIO(raw))
+        pages = []
+        for page in reader.pages[:20]:
+            pages.append(page.extract_text() or '')
+        return '\n\n'.join(pages).strip()
+    except Exception:
+        raise ValueError('Не удалось извлечь текст из PDF')
+
+
+def extract_uploaded_file_text(file_obj):
+    """Извлекает текст из TXT/MD/CSV/DOCX/PDF. Возвращает строку."""
+    if not file_obj:
+        return ''
+    if not isinstance(file_obj, dict):
+        raise ValueError('Некорректный файл')
+
+    name = str(file_obj.get('name') or 'file')
+    data_url = file_obj.get('data') or ''
+    size = int(file_obj.get('size') or 0)
+    if size and size > 8 * 1024 * 1024:
+        raise ValueError('Файл слишком большой. Максимум 8 МБ')
+
+    mime, raw = _decode_data_url(data_url)
+    if len(raw) > 8 * 1024 * 1024:
+        raise ValueError('Файл слишком большой. Максимум 8 МБ')
+
+    lower = name.lower()
+    if lower.endswith(('.txt', '.md', '.csv')) or mime.startswith('text/'):
+        for enc in ('utf-8-sig', 'utf-8', 'cp1251'):
+            try:
+                return raw.decode(enc).strip()
+            except Exception:
+                pass
+        raise ValueError('Не удалось распознать кодировку текстового файла')
+
+    if lower.endswith('.docx') or mime == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+        return _extract_docx_text(raw)
+
+    if lower.endswith('.pdf') or mime == 'application/pdf':
+        return _extract_pdf_text(raw)
+
+    raise ValueError('Поддерживаются только TXT, MD, CSV, DOCX и PDF')
+
 async def handle_proxy(request):
     if request.method == "OPTIONS":
         return web.Response(status=200, headers=CORS_HEADERS)
@@ -577,26 +667,54 @@ async def handle_proxy(request):
 
     token = body.get("token", "")
     work_type = body.get("type", "")
-    text = body.get("text", "")
-    photo = body.get("photo")  # base64 или null
+    text = (body.get("text") or "").strip()
+
+    # Новый формат: photos = [base64, base64]. Старый формат photo тоже поддерживаем.
+    photos = body.get("photos") or []
+    old_photo = body.get("photo")
+    if old_photo:
+        photos = [old_photo] + photos
+    if not isinstance(photos, list):
+        photos = []
+    photos = [p for p in photos if isinstance(p, str) and p.startswith("data:image/")][:2]
+
+    prompt = PROMPTS.get(work_type)
+    if not prompt:
+        return web.json_response({"error": "unknown_type"}, status=400, headers=CORS_HEADERS)
 
     # Проверяем и сразу сжигаем токен, чтобы один токен нельзя было использовать для нескольких проверок
     user_id = consume_token(token)
     if not user_id:
         return web.json_response({"error": "invalid_token"}, status=403, headers=CORS_HEADERS)
 
-    prompt = PROMPTS.get(work_type)
-    if not prompt:
-        return web.json_response({"error": "unknown_type"}, status=400, headers=CORS_HEADERS)
+    try:
+        file_text = extract_uploaded_file_text(body.get("file")) if body.get("file") else ""
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400, headers=CORS_HEADERS)
+
+    file_name = ""
+    if isinstance(body.get("file"), dict):
+        file_name = str(body["file"].get("name") or "файл")
+
+    combined_text = text
+    if file_text:
+        combined_text += f"\n\n--- Текст из файла: {file_name} ---\n{file_text}"
+
+    if not combined_text.strip() and not photos:
+        return web.json_response({"error": "empty_work"}, status=400, headers=CORS_HEADERS)
+
+    # Ограничиваем размер текста, чтобы не улететь в слишком большой запрос
+    if len(combined_text) > 60000:
+        combined_text = combined_text[:60000] + "\n\n[Текст был обрезан до 60000 символов.]"
 
     # Формируем сообщение для xAI
-    if photo:
-        user_content = [
-            {"type": "image_url", "image_url": {"url": photo}},
-            {"type": "text", "text": "Вот фото задания.\n\n" + prompt + text}
-        ]
+    if photos:
+        user_content = []
+        for photo in photos:
+            user_content.append({"type": "image_url", "image_url": {"url": photo}})
+        user_content.append({"type": "text", "text": "Вот фото/файл задания и текст работы.\n\n" + prompt + combined_text})
     else:
-        user_content = prompt + text
+        user_content = prompt + combined_text
 
     import aiohttp as aiohttp_client
     try:
