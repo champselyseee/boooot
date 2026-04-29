@@ -19,7 +19,7 @@ RUB_1     = 27
 RUB_5     = 110
 RUB_MONTH = 210
 
-WHITELIST = {"champselyseee", "riavlw", "dilaiip", "ENOTINA0"}
+WHITELIST = {"champselyseee"}
 
 YUKASSA_SHOP_ID = os.environ.get("YUKASSA_SHOP_ID", "")
 YUKASSA_SECRET  = os.environ.get("YUKASSA_SECRET", "")
@@ -180,7 +180,7 @@ def get_user(user_id, username=None):
     con = sqlite3.connect(DB_PATH)
     row = con.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
     if not row:
-        con.execute("INSERT INTO users VALUES (?,?,0,0,0)", (user_id, username))
+        con.execute("INSERT INTO users VALUES (?,?,0,0,0,NULL)", (user_id, username))
         con.commit()
         row = con.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
     con.close()
