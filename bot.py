@@ -189,13 +189,31 @@ def init_db():
 
 def get_user(user_id, username=None):
     con = sqlite3.connect(DB_PATH)
-    row = con.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+    row = con.execute(
+        "SELECT user_id, username, free_used, paid_checks, subscription_until "
+        "FROM users WHERE user_id=?",
+        (user_id,)
+    ).fetchone()
     if not row:
-        con.execute("INSERT INTO users VALUES (?,?,0,0,0)", (user_id, username))
+        con.execute(
+            "INSERT INTO users (user_id, username, free_used, paid_checks, subscription_until) "
+            "VALUES (?, ?, 0, 0, 0)",
+            (user_id, username)
+        )
         con.commit()
-        row = con.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+        row = con.execute(
+            "SELECT user_id, username, free_used, paid_checks, subscription_until "
+            "FROM users WHERE user_id=?",
+            (user_id,)
+        ).fetchone()
     con.close()
-    return {"user_id":row[0],"username":row[1],"free_used":row[2],"paid_checks":row[3],"subscription_until":row[4]}
+    return {
+        "user_id": row[0],
+        "username": row[1],
+        "free_used": row[2],
+        "paid_checks": row[3],
+        "subscription_until": row[4],
+    }
 
 def use_free_check(user_id):
     con = sqlite3.connect(DB_PATH)
