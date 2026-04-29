@@ -243,16 +243,27 @@ def create_token(user_id):
     return token
 
 def consume_token(token):
-    """Проверяет и сжигает токен. Возвращает user_id или None."""
+    """Атомарно проверяет и сжигает токен. Возвращает user_id или None."""
+    now = int(time.time())
     con = sqlite3.connect(DB_PATH)
-    row = con.execute("SELECT user_id, used, created_at FROM tokens WHERE token=?", (token,)).fetchone()
-    if not row:
-        con.close(); return None
-    user_id, used, created_at = row
-    if used or (int(time.time()) - created_at > 1800):
-        con.close(); return None
-    con.execute("UPDATE tokens SET used=1 WHERE token=?", (token,)); con.commit(); con.close()
-    return user_id
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT user_id, used, created_at FROM tokens WHERE token=?", (token,)).fetchone()
+        if not row:
+            con.rollback()
+            return None
+        user_id, used, created_at = row
+        if used or (now - created_at > 1800):
+            con.rollback()
+            return None
+        con.execute("UPDATE tokens SET used=1 WHERE token=?", (token,))
+        con.commit()
+        return user_id
+    except Exception:
+        con.rollback()
+        return None
+    finally:
+        con.close()
 
 def validate_token(token):
     """Только проверяет, не сжигает — для /check_token."""
@@ -262,7 +273,6 @@ def validate_token(token):
     if not row: return False
     used, created_at = row
     return not used and (int(time.time()) - created_at <= 1800)
-
 
 
 def get_user_by_token(token):
@@ -470,7 +480,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rub_map = {
             "buy_rub_1":     ("r1",   "1 проверка — 27 руб",      RUB_1,   "rub_1"),
             "buy_rub_5":     ("r5",   "5 проверок — 110 руб",     RUB_5,   "rub_5"),
-            "buy_rub_month": ("rmon", "Безлимит/мес — 230 руб",   RUB_MONTH, "rub_month"),
+            "buy_rub_month": ("rmon", "Безлимит/мес — 210 руб",   RUB_MONTH, "rub_month"),
         }
         key, label, amount, pl = rub_map[query.data]
 
@@ -570,8 +580,8 @@ async def handle_proxy(request):
     text = body.get("text", "")
     photo = body.get("photo")  # base64 или null
 
-    # Проверяем токен без сжигания — сожжём только при успехе
-    user_id = get_user_by_token(token)
+    # Проверяем и сразу сжигаем токен, чтобы один токен нельзя было использовать для нескольких проверок
+    user_id = consume_token(token)
     if not user_id:
         return web.json_response({"error": "invalid_token"}, status=403, headers=CORS_HEADERS)
 
@@ -609,6 +619,7 @@ async def handle_proxy(request):
                         return web.json_response({"error": f"xAI error: {err[:200]}"}, status=502, headers=CORS_HEADERS)
                     data = await resp.json()
                     answer = data["choices"][0]["message"]["content"]
+                    save_history(user_id, work_type, answer)
                     return web.json_response({"answer": answer}, headers=CORS_HEADERS)
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500, headers=CORS_HEADERS)
