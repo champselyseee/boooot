@@ -1,28 +1,36 @@
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, WebAppInfo, LabeledPrice, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, PreCheckoutQueryHandler, MessageHandler, filters, CallbackQueryHandler
-import sqlite3, secrets, time, asyncio, os, json
+from telegram import (Update, ReplyKeyboardMarkup, ReplyKeyboardRemove,
+                       KeyboardButton, WebAppInfo, LabeledPrice,
+                       InlineKeyboardMarkup, InlineKeyboardButton)
+from telegram.ext import (ApplicationBuilder, CommandHandler, ContextTypes,
+                           PreCheckoutQueryHandler, MessageHandler, filters,
+                           CallbackQueryHandler)
+import sqlite3, secrets, time, asyncio, os, uuid
+from contextlib import contextmanager
+import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
 
 load_dotenv()
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GROK_API_KEY   = os.environ.get("GROK_API_KEY")
-WEB_APP_URL    = "https://steady-brioche-e0b7ee.netlify.app/"
-PORT           = int(os.environ.get("PORT", 8080))
-DB_PATH        = os.environ.get("DB_PATH", "users.db")
+
+TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN")
+GROK_API_KEY      = os.environ.get("GROK_API_KEY")
+WEB_APP_URL       = os.environ.get("WEB_APP_URL", "https://mirrrr.vercel.app")
+PORT              = int(os.environ.get("PORT", 8080))
+DB_PATH           = os.environ.get("DB_PATH", "users.db")
+XAI_MODEL         = os.environ.get("XAI_MODEL", "grok-4.20-0309-reasoning")
+OCR_MODEL         = os.environ.get("OCR_MODEL", XAI_MODEL)
+ENABLE_KEEPALIVE  = os.environ.get("ENABLE_KEEPALIVE", "true").lower() == "true"
+YUKASSA_SHOP_ID   = os.environ.get("YUKASSA_SHOP_ID", "")
+YUKASSA_SECRET    = os.environ.get("YUKASSA_SECRET", "")
 
 STARS_1     = 25
 STARS_5     = 100
 STARS_MONTH = 220
-
-RUB_1     = 27
-RUB_5     = 110
-RUB_MONTH = 210
+RUB_1       = 27
+RUB_5       = 110
+RUB_MONTH   = 210
 
 WHITELIST = {"champselyseee", "dilaiip", "riavlw", "ENOTINA0", "ssmatwikss"}
-
-YUKASSA_SHOP_ID = os.environ.get("YUKASSA_SHOP_ID", "")
-YUKASSA_SECRET  = os.environ.get("YUKASSA_SECRET", "")
 
 CORS_HEADERS = {
     "Access-Control-Allow-Origin":  "*",
@@ -162,51 +170,80 @@ PROMPTS = {
 Теперь проверь следующее сочинение:\n\n`"""
 }
 
+OCR_PROMPT = """Ты — система оптического распознавания рукописного текста (OCR).
+Твоя задача: точно перевести рукописный текст с фотографии в печатный вид.
+
+ПРАВИЛА:
+- Переводи ТОЛЬКО тот текст, который видишь на фото
+- Не добавляй ничего от себя и не исправляй содержание
+- Сохраняй структуру и абзацы как в оригинале
+- Не исправляй орфографию и грамматику — переводи буква в букву
+- Если слово неразборчиво — напиши наиболее вероятный вариант и добавь [?]
+- Выведи ТОЛЬКО распознанный текст, без заголовков и комментариев"""
+
+
 # ── База данных ──
-def init_db():
-    con = sqlite3.connect(DB_PATH)
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA synchronous=NORMAL")
-    con.execute("""CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY, username TEXT,
-        free_used INTEGER DEFAULT 0, paid_checks INTEGER DEFAULT 0,
-        subscription_until INTEGER DEFAULT 0)""")
-    con.execute("""CREATE TABLE IF NOT EXISTS tokens (
-        token TEXT PRIMARY KEY, user_id INTEGER,
-        created_at INTEGER, used INTEGER DEFAULT 0)""")
-    con.execute("""CREATE TABLE IF NOT EXISTS history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER, work_type TEXT,
-        result TEXT, created_at INTEGER)""")
-    con.execute("""CREATE TABLE IF NOT EXISTS referrals (
-        referrer_id INTEGER, referred_id INTEGER PRIMARY KEY,
-        created_at INTEGER, rewarded INTEGER DEFAULT 0)""")
+
+def _ensure_db_dir():
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
+
+
+@contextmanager
+def get_db():
+    con = sqlite3.connect(DB_PATH, timeout=10)
     try:
-        con.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER DEFAULT NULL")
-    except sqlite3.OperationalError:
-        pass
-    con.commit(); con.close()
+        yield con
+    finally:
+        con.close()
+
+
+def init_db():
+    _ensure_db_dir()
+    with get_db() as con:
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
+        con.execute("""CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY, username TEXT,
+            free_used INTEGER DEFAULT 0, paid_checks INTEGER DEFAULT 0,
+            subscription_until INTEGER DEFAULT 0)""")
+        con.execute("""CREATE TABLE IF NOT EXISTS tokens (
+            token TEXT PRIMARY KEY, user_id INTEGER,
+            created_at INTEGER, used INTEGER DEFAULT 0)""")
+        con.execute("""CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER, work_type TEXT,
+            result TEXT, created_at INTEGER)""")
+        con.execute("""CREATE TABLE IF NOT EXISTS referrals (
+            referrer_id INTEGER, referred_id INTEGER PRIMARY KEY,
+            created_at INTEGER, rewarded INTEGER DEFAULT 0)""")
+        try:
+            con.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER DEFAULT NULL")
+        except sqlite3.OperationalError:
+            pass
+        con.commit()
+
 
 def get_user(user_id, username=None):
-    con = sqlite3.connect(DB_PATH)
-    row = con.execute(
-        "SELECT user_id, username, free_used, paid_checks, subscription_until "
-        "FROM users WHERE user_id=?",
-        (user_id,)
-    ).fetchone()
-    if not row:
-        con.execute(
-            "INSERT INTO users (user_id, username, free_used, paid_checks, subscription_until) "
-            "VALUES (?, ?, 0, 0, 0)",
-            (user_id, username)
-        )
-        con.commit()
+    with get_db() as con:
         row = con.execute(
             "SELECT user_id, username, free_used, paid_checks, subscription_until "
             "FROM users WHERE user_id=?",
             (user_id,)
         ).fetchone()
-    con.close()
+        if not row:
+            con.execute(
+                "INSERT INTO users (user_id, username, free_used, paid_checks, subscription_until) "
+                "VALUES (?, ?, 0, 0, 0)",
+                (user_id, username)
+            )
+            con.commit()
+            row = con.execute(
+                "SELECT user_id, username, free_used, paid_checks, subscription_until "
+                "FROM users WHERE user_id=?",
+                (user_id,)
+            ).fetchone()
     return {
         "user_id": row[0],
         "username": row[1],
@@ -215,145 +252,173 @@ def get_user(user_id, username=None):
         "subscription_until": row[4],
     }
 
+
 def use_free_check(user_id):
-    con = sqlite3.connect(DB_PATH)
-    con.execute("UPDATE users SET free_used=1 WHERE user_id=?", (user_id,)); con.commit(); con.close()
+    with get_db() as con:
+        con.execute("UPDATE users SET free_used=1 WHERE user_id=?", (user_id,))
+        con.commit()
+
 
 def add_paid_checks(user_id, count):
-    con = sqlite3.connect(DB_PATH)
-    con.execute("UPDATE users SET paid_checks=paid_checks+? WHERE user_id=?", (count,user_id)); con.commit(); con.close()
+    with get_db() as con:
+        con.execute("UPDATE users SET paid_checks=paid_checks+? WHERE user_id=?", (count, user_id))
+        con.commit()
+
 
 def use_paid_check(user_id):
-    con = sqlite3.connect(DB_PATH)
-    con.execute("UPDATE users SET paid_checks=paid_checks-1 WHERE user_id=?", (user_id,)); con.commit(); con.close()
+    with get_db() as con:
+        con.execute("UPDATE users SET paid_checks=MAX(0, paid_checks-1) WHERE user_id=?", (user_id,))
+        con.commit()
+
 
 def add_subscription(user_id, days=30):
-    con = sqlite3.connect(DB_PATH)
     now = int(time.time())
-    row = con.execute("SELECT subscription_until FROM users WHERE user_id=?", (user_id,)).fetchone()
-    current = row[0] if row and row[0] > now else now
-    new_until = current + days * 86400
-    con.execute("UPDATE users SET subscription_until=? WHERE user_id=?", (new_until, user_id)); con.commit(); con.close()
+    with get_db() as con:
+        row = con.execute("SELECT subscription_until FROM users WHERE user_id=?", (user_id,)).fetchone()
+        current = row[0] if row and row[0] > now else now
+        new_until = current + days * 86400
+        con.execute("UPDATE users SET subscription_until=? WHERE user_id=?", (new_until, user_id))
+        con.commit()
     return new_until
+
 
 def create_token(user_id):
     token = secrets.token_hex(16)
-    con = sqlite3.connect(DB_PATH)
-    con.execute("INSERT INTO tokens VALUES (?,?,?,0)", (token, user_id, int(time.time()))); con.commit(); con.close()
+    with get_db() as con:
+        con.execute("INSERT INTO tokens VALUES (?,?,?,0)", (token, user_id, int(time.time())))
+        con.commit()
     return token
+
 
 def consume_token(token):
     """Атомарно проверяет и сжигает токен. Возвращает user_id или None."""
     now = int(time.time())
-    con = sqlite3.connect(DB_PATH)
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        row = con.execute("SELECT user_id, used, created_at FROM tokens WHERE token=?", (token,)).fetchone()
-        if not row:
+    with get_db() as con:
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT user_id, used, created_at FROM tokens WHERE token=?", (token,)
+            ).fetchone()
+            if not row:
+                con.rollback()
+                return None
+            user_id, used, created_at = row
+            if used or (now - created_at > 7200):
+                con.rollback()
+                return None
+            con.execute("UPDATE tokens SET used=1 WHERE token=?", (token,))
+            con.commit()
+            return user_id
+        except Exception:
             con.rollback()
             return None
-        user_id, used, created_at = row
-        if used or (now - created_at > 1800):
-            con.rollback()
-            return None
-        con.execute("UPDATE tokens SET used=1 WHERE token=?", (token,))
-        con.commit()
-        return user_id
-    except Exception:
-        con.rollback()
-        return None
-    finally:
-        con.close()
+
 
 def validate_token(token):
     """Только проверяет, не сжигает — для /check_token."""
-    con = sqlite3.connect(DB_PATH)
-    row = con.execute("SELECT used, created_at FROM tokens WHERE token=?", (token,)).fetchone()
-    con.close()
-    if not row: return False
+    with get_db() as con:
+        row = con.execute("SELECT used, created_at FROM tokens WHERE token=?", (token,)).fetchone()
+    if not row:
+        return False
     used, created_at = row
-    return not used and (int(time.time()) - created_at <= 1800)
+    return not used and (int(time.time()) - created_at <= 7200)
 
 
 def get_user_by_token(token):
     """Проверяет токен и возвращает user_id, не сжигая его."""
-    con = sqlite3.connect(DB_PATH)
-    row = con.execute("SELECT user_id, used, created_at FROM tokens WHERE token=?", (token,)).fetchone()
-    con.close()
-    if not row: return None
+    with get_db() as con:
+        row = con.execute(
+            "SELECT user_id, used, created_at FROM tokens WHERE token=?",
+            (token,)
+        ).fetchone()
+    if not row:
+        return None
     uid, used, created_at = row
-    if used or (int(time.time()) - created_at > 1800): return None
+    if used or (int(time.time()) - created_at > 7200):
+        return None
     return uid
 
-def burn_token(token):
-    """Сжигает токен."""
-    con = sqlite3.connect(DB_PATH)
-    con.execute("UPDATE tokens SET used=1 WHERE token=?", (token,))
-    con.commit(); con.close()
 
 def set_referrer(referred_id, referrer_id):
     if referred_id == referrer_id:
         return
-    con = sqlite3.connect(DB_PATH)
-    exists = con.execute("SELECT 1 FROM referrals WHERE referred_id=?", (referred_id,)).fetchone()
-    if not exists:
-        con.execute("INSERT INTO referrals VALUES (?,?,?,0)", (referrer_id, referred_id, int(time.time())))
-        con.execute("UPDATE users SET referred_by=? WHERE user_id=?", (referrer_id, referred_id))
-        con.commit()
-    con.close()
+    with get_db() as con:
+        exists = con.execute(
+            "SELECT 1 FROM referrals WHERE referred_id=?", (referred_id,)
+        ).fetchone()
+        if not exists:
+            con.execute(
+                "INSERT INTO referrals VALUES (?,?,?,0)", (referrer_id, referred_id, int(time.time()))
+            )
+            con.execute("UPDATE users SET referred_by=? WHERE user_id=?", (referrer_id, referred_id))
+            con.commit()
+
 
 def reward_referrer(referred_id):
-    con = sqlite3.connect(DB_PATH)
-    row = con.execute("SELECT referrer_id, rewarded FROM referrals WHERE referred_id=?", (referred_id,)).fetchone()
-    if not row or row[1]:
-        con.close(); return None
-    referrer_id = row[0]
-    con.execute("UPDATE referrals SET rewarded=1 WHERE referred_id=?", (referred_id,))
-    con.execute("UPDATE users SET paid_checks=paid_checks+1 WHERE user_id=?", (referrer_id,))
-    con.commit()
-    con.close()
+    with get_db() as con:
+        row = con.execute(
+            "SELECT referrer_id, rewarded FROM referrals WHERE referred_id=?", (referred_id,)
+        ).fetchone()
+        if not row or row[1]:
+            return None
+        referrer_id = row[0]
+        con.execute("UPDATE referrals SET rewarded=1 WHERE referred_id=?", (referred_id,))
+        con.execute("UPDATE users SET paid_checks=paid_checks+1 WHERE user_id=?", (referrer_id,))
+        con.commit()
     return referrer_id
 
+
 def save_history(user_id, work_type, result):
-    con = sqlite3.connect(DB_PATH)
-    con.execute("INSERT INTO history (user_id, work_type, result, created_at) VALUES (?,?,?,?)",
-        (user_id, work_type, result[:3000], int(time.time())))
-    con.commit(); con.close()
+    with get_db() as con:
+        con.execute(
+            "INSERT INTO history (user_id, work_type, result, created_at) VALUES (?,?,?,?)",
+            (user_id, work_type, result[:3000], int(time.time()))
+        )
+        con.commit()
+
 
 def get_history(user_id, limit=5):
-    con = sqlite3.connect(DB_PATH)
-    rows = con.execute(
-        "SELECT work_type, result, created_at FROM history WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
-        (user_id, limit)).fetchall()
-    con.close()
+    with get_db() as con:
+        rows = con.execute(
+            "SELECT work_type, result, created_at FROM history "
+            "WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+            (user_id, limit)
+        ).fetchall()
     return rows
+
 
 def is_whitelisted(username):
     return bool(username) and username.lower() in {w.lower() for w in WHITELIST}
 
+
 def has_subscription(data):
     return data["subscription_until"] > int(time.time())
+
 
 def has_access(data):
     return has_subscription(data) or data["paid_checks"] > 0
 
+
 def webapp_keyboard(token):
     return ReplyKeyboardMarkup(
         [[KeyboardButton("✍️ Открыть проверку", web_app=WebAppInfo(url=f"{WEB_APP_URL}?token={token}"))]],
-        resize_keyboard=True, one_time_keyboard=False)
+        resize_keyboard=True, one_time_keyboard=False
+    )
+
 
 def payment_menu(highlight=None):
     def mark(key, text):
         return ("✅ " if highlight == key else "") + text
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(mark("s1",    f"⭐ 1 проверка — {STARS_1} Stars"),      callback_data="buy_stars_1")],
-        [InlineKeyboardButton(mark("s5",    f"⭐ 5 проверок — {STARS_5} Stars"),      callback_data="buy_stars_5")],
-        [InlineKeyboardButton(mark("smon",  f"⭐ Безлимит/мес — {STARS_MONTH} Stars"), callback_data="buy_stars_month")],
+        [InlineKeyboardButton(mark("s1",   f"⭐ 1 проверка — {STARS_1} Stars"),       callback_data="buy_stars_1")],
+        [InlineKeyboardButton(mark("s5",   f"⭐ 5 проверок — {STARS_5} Stars"),       callback_data="buy_stars_5")],
+        [InlineKeyboardButton(mark("smon", f"⭐ Безлимит/мес — {STARS_MONTH} Stars"), callback_data="buy_stars_month")],
         [InlineKeyboardButton("──── или картой ────",                                  callback_data="noop")],
-        [InlineKeyboardButton(mark("r1",    f"💳 1 проверка — {RUB_1} ₽"),            callback_data="buy_rub_1")],
-        [InlineKeyboardButton(mark("r5",    f"💳 5 проверок — {RUB_5} ₽"),            callback_data="buy_rub_5")],
-        [InlineKeyboardButton(mark("rmon",  f"💳 Безлимит/мес — {RUB_MONTH} ₽"),     callback_data="buy_rub_month")],
+        [InlineKeyboardButton(mark("r1",   f"💳 1 проверка — {RUB_1} ₽"),             callback_data="buy_rub_1")],
+        [InlineKeyboardButton(mark("r5",   f"💳 5 проверок — {RUB_5} ₽"),             callback_data="buy_rub_5")],
+        [InlineKeyboardButton(mark("rmon", f"💳 Безлимит/мес — {RUB_MONTH} ₽"),      callback_data="buy_rub_month")],
     ])
+
 
 async def give_access(update, context, data, is_whitelist=False):
     user_id = data["user_id"]
@@ -363,20 +428,30 @@ async def give_access(update, context, data, is_whitelist=False):
         if has_subscription(data):
             days_left = (data["subscription_until"] - int(time.time())) // 86400
             sub_text = f"📅 Подписка активна ещё {days_left} дн.\n\n"
-        await update.message.reply_text(f"{sub_text}Нажми кнопку ниже 👇", reply_markup=webapp_keyboard(token))
+        await update.message.reply_text(
+            f"{sub_text}Нажми кнопку ниже 👇",
+            reply_markup=webapp_keyboard(token)
+        )
         return
     token = create_token(user_id)
     use_paid_check(user_id)
     remaining = data["paid_checks"] - 1
     await update.message.reply_text(
         f"✅ Осталось проверок после этой: {remaining}\n\nНажми кнопку 👇",
-        reply_markup=webapp_keyboard(token))
+        reply_markup=webapp_keyboard(token)
+    )
     if remaining == 0:
         asyncio.create_task(remove_keyboard_later(context, user_id))
 
+
 async def remove_keyboard_later(context, chat_id):
     await asyncio.sleep(1860)
-    await context.bot.send_message(chat_id=chat_id, text="⏰ Проверки закончились. Купи ещё → /buy", reply_markup=ReplyKeyboardRemove())
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="⏰ Проверки закончились. Купи ещё → /buy",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -392,28 +467,44 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except ValueError:
                 pass
     if is_whitelisted(username):
-        await give_access(update, context, data, is_whitelist=True); return
+        await give_access(update, context, data, is_whitelist=True)
+        return
     if not data["free_used"]:
         token = create_token(user.id)
         use_free_check(user.id)
-        await update.message.reply_text("👋 Привет! Тебе доступна 1 бесплатная проверка.\n\nНажми кнопку ниже 👇", reply_markup=webapp_keyboard(token))
-        asyncio.create_task(remove_keyboard_later(context, user.id)); return
+        await update.message.reply_text(
+            "👋 Привет! Тебе доступна 1 бесплатная проверка.\n\nНажми кнопку ниже 👇",
+            reply_markup=webapp_keyboard(token)
+        )
+        asyncio.create_task(remove_keyboard_later(context, user.id))
+        return
     if has_access(data):
-        await give_access(update, context, data); return
-    await update.message.reply_text("🔒 Доступ закончился.\n\nВыбери способ оплаты:", reply_markup=payment_menu())
+        await give_access(update, context, data)
+        return
+    await update.message.reply_text(
+        "🔒 Доступ закончился.\n\nВыбери способ оплаты:",
+        reply_markup=payment_menu()
+    )
+
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Выбери способ оплаты:", reply_markup=payment_menu())
+
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     data = get_user(user.id, user.username or "")
     if is_whitelisted(user.username or ""):
-        await update.message.reply_text("👑 У тебя безлимитный доступ."); return
+        await update.message.reply_text("👑 У тебя безлимитный доступ.")
+        return
     if has_subscription(data):
         days_left = (data["subscription_until"] - int(time.time())) // 86400
-        await update.message.reply_text(f"📅 Подписка активна ещё {days_left} дн."); return
-    await update.message.reply_text(f"📊 Проверок осталось: {data['paid_checks']}\n\nКупить ещё → /buy")
+        await update.message.reply_text(f"📅 Подписка активна ещё {days_left} дн.")
+        return
+    await update.message.reply_text(
+        f"📊 Проверок осталось: {data['paid_checks']}\n\nКупить ещё → /buy"
+    )
+
 
 async def ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -421,10 +512,13 @@ async def ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
     link = f"https://t.me/{bot_info.username}?start=ref_{user.id}"
     total, rewarded = 0, 0
     try:
-        con = sqlite3.connect(DB_PATH)
-        total = con.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=?", (user.id,)).fetchone()[0]
-        rewarded = con.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND rewarded=1", (user.id,)).fetchone()[0]
-        con.close()
+        with get_db() as con:
+            total = con.execute(
+                "SELECT COUNT(*) FROM referrals WHERE referrer_id=?", (user.id,)
+            ).fetchone()[0]
+            rewarded = con.execute(
+                "SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND rewarded=1", (user.id,)
+            ).fetchone()[0]
     except Exception:
         pass
     await update.message.reply_text(
@@ -435,8 +529,10 @@ async def ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Купили (бонусов получено): {rewarded}"
     )
 
+
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("По всем вопросам и проблемам пиши: @champselyseee")
+
 
 async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -461,44 +557,54 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"{i}. {tname} — {dt}\n{preview}\n\n"
     await update.message.reply_text(text)
 
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
     invoices = {
-        "buy_stars_1":     ("1 проверка ЕГЭ",  "Одна проверка по критериям ЕГЭ 2026",       "stars_1",     STARS_1),
-        "buy_stars_5":     ("5 проверок ЕГЭ",  "Пять проверок по критериям ЕГЭ 2026",       "stars_5",     STARS_5),
-        "buy_stars_month": ("Месяц безлимит",   "Безлимитные проверки на 30 дней",           "stars_month", STARS_MONTH),
+        "buy_stars_1":     ("1 проверка ЕГЭ",  "Одна проверка по критериям ЕГЭ 2026",  "stars_1",     STARS_1),
+        "buy_stars_5":     ("5 проверок ЕГЭ",  "Пять проверок по критериям ЕГЭ 2026",  "stars_5",     STARS_5),
+        "buy_stars_month": ("Месяц безлимит",   "Безлимитные проверки на 30 дней",      "stars_month", STARS_MONTH),
     }
     if query.data in invoices:
         title, desc, payload, price = invoices[query.data]
-        await context.bot.send_invoice(chat_id=query.message.chat_id, title=title, description=desc,
-            payload=payload, provider_token="", currency="XTR", prices=[LabeledPrice(title, price)])
-    elif query.data == "noop":
+        await context.bot.send_invoice(
+            chat_id=query.message.chat_id, title=title, description=desc,
+            payload=payload, provider_token="", currency="XTR",
+            prices=[LabeledPrice(title, price)]
+        )
         return
 
-    elif query.data in ("buy_rub_1", "buy_rub_5", "buy_rub_month"):
+    if query.data == "noop":
+        return
+
+    if query.data in ("buy_rub_1", "buy_rub_5", "buy_rub_month"):
         rub_map = {
-            "buy_rub_1":     ("r1",   "1 проверка — 27 руб",      RUB_1,   "rub_1"),
-            "buy_rub_5":     ("r5",   "5 проверок — 110 руб",     RUB_5,   "rub_5"),
-            "buy_rub_month": ("rmon", "Безлимит/мес — 210 руб",   RUB_MONTH, "rub_month"),
+            "buy_rub_1":     ("r1",   f"1 проверка — {RUB_1} руб",       RUB_1,     "rub_1"),
+            "buy_rub_5":     ("r5",   f"5 проверок — {RUB_5} руб",       RUB_5,     "rub_5"),
+            "buy_rub_month": ("rmon", f"Безлимит/мес — {RUB_MONTH} руб", RUB_MONTH, "rub_month"),
         }
         key, label, amount, pl = rub_map[query.data]
 
         if not YUKASSA_SHOP_ID or not YUKASSA_SECRET:
             await query.message.reply_text(
-                "💳 Выбран тариф: " + label + "\n\nОплата картой скоро будет доступна!\nПока можно оплатить через Telegram Stars ⭐",
+                f"💳 Выбран тариф: {label}\n\nОплата картой скоро будет доступна!\n"
+                "Пока можно оплатить через Telegram Stars ⭐",
                 reply_markup=payment_menu(highlight=key)
             )
             return
 
-        import aiohttp as _h, uuid
-        async with _h.ClientSession() as s:
+        async with aiohttp.ClientSession() as s:
             async with s.post(
                 "https://api.yookassa.ru/v3/payments",
-                auth=_h.BasicAuth(YUKASSA_SHOP_ID, YUKASSA_SECRET),
-                headers={"Idempotence-Key": str(uuid.uuid4()), "Content-Type": "application/json"},
+                auth=aiohttp.BasicAuth(YUKASSA_SHOP_ID, YUKASSA_SECRET),
+                headers={
+                    "Idempotence-Key": str(uuid.uuid4()),
+                    "Content-Type": "application/json"
+                },
                 json={
-                    "amount": {"value": str(amount) + ".00", "currency": "RUB"},
+                    "amount": {"value": f"{amount}.00", "currency": "RUB"},
                     "confirmation": {"type": "redirect", "return_url": "https://t.me/"},
                     "capture": True,
                     "description": label,
@@ -509,15 +615,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     d = await r.json()
                     pay_url = d["confirmation"]["confirmation_url"]
                     await query.message.reply_text(
-                        "💳 " + label,
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Оплатить картой", url=pay_url)]])
+                        f"💳 {label}",
+                        reply_markup=InlineKeyboardMarkup(
+                            [[InlineKeyboardButton("Оплатить картой", url=pay_url)]]
+                        )
                     )
                 else:
                     err = await r.text()
-                    await query.message.reply_text("❌ Ошибка: " + err[:200])
+                    await query.message.reply_text(f"❌ Ошибка: {err[:200]}")
+
 
 async def pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.pre_checkout_query.answer(ok=True)
+
 
 async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -525,7 +635,10 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
     referrer_id = reward_referrer(user_id)
     if referrer_id:
         try:
-            await context.bot.send_message(chat_id=referrer_id, text="🎉 Твой друг купил проверку! Тебе начислена 1 бесплатная проверка.\n\nПроверь баланс → /balance")
+            await context.bot.send_message(
+                chat_id=referrer_id,
+                text="🎉 Твой друг купил проверку! Тебе начислена 1 бесплатная проверка.\n\nПроверь баланс → /balance"
+            )
         except Exception:
             pass
     if payload == "stars_month":
@@ -534,7 +647,8 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
         token = create_token(user_id)
         await update.message.reply_text(
             f"✅ Подписка активна до {datetime.fromtimestamp(until).strftime('%d.%m.%Y')}!\n\nНажми кнопку 👇",
-            reply_markup=webapp_keyboard(token))
+            reply_markup=webapp_keyboard(token)
+        )
     else:
         count = 5 if payload == "stars_5" else 1
         add_paid_checks(user_id, count)
@@ -544,22 +658,61 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
         remaining = data["paid_checks"] - 1
         await update.message.reply_text(
             f"✅ Оплата прошла! Куплено: {count} пр.\nОсталось после этой: {remaining}\n\nНажми кнопку 👇",
-            reply_markup=webapp_keyboard(token))
+            reply_markup=webapp_keyboard(token)
+        )
         if remaining == 0:
             asyncio.create_task(remove_keyboard_later(context, user_id))
 
-async def _send_ref_reminder(user_id):
+
+async def _send_new_token(user_id):
+    """После успешной проверки xAI — шлёт новую кнопку WebApp если у юзера есть доступ."""
     try:
         from telegram import Bot
         bot = Bot(token=TELEGRAM_TOKEN)
-        await bot.send_message(
-            chat_id=user_id,
-            text="👥 Понравился бот? Пригласи друга и получи бесплатную проверку!\n\nТвоя реферальная ссылка → /ref"
-        )
+        data = get_user(user_id)
+        username = data.get("username", "") or ""
+        if is_whitelisted(username) or has_subscription(data):
+            token = create_token(user_id)
+            await bot.send_message(
+                chat_id=user_id,
+                text="✅ Готово! Нажми кнопку для следующей проверки 👇",
+                reply_markup=webapp_keyboard(token)
+            )
+        elif data["paid_checks"] > 0:
+            use_paid_check(user_id)
+            remaining = data["paid_checks"] - 1
+            token = create_token(user_id)
+            await bot.send_message(
+                chat_id=user_id,
+                text=f"✅ Готово! Осталось проверок: {remaining}\n\nНажми кнопку 👇",
+                reply_markup=webapp_keyboard(token)
+            )
+        else:
+            await bot.send_message(
+                chat_id=user_id,
+                text="🔒 Проверки закончились.\n\nКупить ещё → /buy"
+            )
     except Exception:
         pass
 
+
+async def _keepalive_loop():
+    """Пингует себя каждые 4 минуты — актуально только на Railway/Render (не Vercel)."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            async with aiohttp.ClientSession() as s:
+                await s.get(
+                    f"http://localhost:{PORT}/check_token?token=ping",
+                    timeout=aiohttp.ClientTimeout(total=10)
+                )
+        except Exception:
+            pass
+        await asyncio.sleep(240)
+
+
 # ── HTTP эндпоинты ──
+
 async def handle_check_token(request):
     if request.method == "OPTIONS":
         return web.Response(status=200, headers=CORS_HEADERS)
@@ -568,11 +721,76 @@ async def handle_check_token(request):
     return web.json_response({"ok": valid}, headers=CORS_HEADERS)
 
 
+async def handle_ocr(request):
+    """Распознаёт рукописный текст с фото. Токен проверяется, но не сжигается."""
+    if request.method == "OPTIONS":
+        return web.Response(status=200, headers=CORS_HEADERS)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "bad json"}, status=400, headers=CORS_HEADERS)
+
+    token = body.get("token", "")
+    photo = body.get("photo", "")
+
+    user_id = get_user_by_token(token)
+    if not user_id:
+        return web.json_response({"error": "invalid_token"}, status=403, headers=CORS_HEADERS)
+
+    if not photo or not isinstance(photo, str) or not photo.startswith("data:image/"):
+        return web.json_response({"error": "Необходимо предоставить фото"}, status=400, headers=CORS_HEADERS)
+
+    try:
+        async with xai_semaphore:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://api.x.ai/v1/chat/completions",
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {GROK_API_KEY}"
+                    },
+                    json={
+                        "model": OCR_MODEL,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "image_url", "image_url": {"url": photo}},
+                                    {"type": "text", "text": OCR_PROMPT}
+                                ]
+                            }
+                        ]
+                    },
+                    timeout=aiohttp.ClientTimeout(total=60)
+                ) as resp:
+                    if resp.status != 200:
+                        err = await resp.text()
+                        return web.json_response(
+                            {"error": f"Ошибка распознавания: {err[:200]}"}, status=502, headers=CORS_HEADERS
+                        )
+                    data = await resp.json()
+                    choices = data.get("choices")
+                    if not choices:
+                        return web.json_response(
+                            {"error": "Не удалось распознать текст"}, status=502, headers=CORS_HEADERS
+                        )
+                    recognized = choices[0].get("message", {}).get("content", "").strip()
+                    if not recognized:
+                        return web.json_response(
+                            {"error": "Не удалось распознать текст на фото"}, status=502, headers=CORS_HEADERS
+                        )
+                    return web.json_response({"text": recognized}, headers=CORS_HEADERS)
+    except asyncio.TimeoutError:
+        return web.json_response({"error": "Таймаут распознавания"}, status=504, headers=CORS_HEADERS)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500, headers=CORS_HEADERS)
+
+
 def _decode_data_url(data_url):
     """Возвращает (mime, bytes) из data URL."""
     import base64
     if not isinstance(data_url, str) or ',' not in data_url:
-        raise ValueError('Некорректный файл')
+        raise ValueError("Некорректный файл")
     header, b64 = data_url.split(',', 1)
     mime = 'application/octet-stream'
     if header.startswith('data:'):
@@ -580,7 +798,7 @@ def _decode_data_url(data_url):
     try:
         raw = base64.b64decode(b64, validate=True)
     except Exception:
-        raise ValueError('Не удалось прочитать файл')
+        raise ValueError("Не удалось прочитать файл")
     return mime, raw
 
 
@@ -588,10 +806,10 @@ def _extract_docx_text(raw):
     import io, zipfile, xml.etree.ElementTree as ET
     try:
         with zipfile.ZipFile(io.BytesIO(raw)) as z:
-            xml = z.read('word/document.xml')
+            xml_data = z.read('word/document.xml')
     except Exception:
-        raise ValueError('Не удалось прочитать DOCX-файл')
-    root = ET.fromstring(xml)
+        raise ValueError("Не удалось прочитать DOCX-файл")
+    root = ET.fromstring(xml_data)
     ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
     paragraphs = []
     for p in root.findall('.//w:p', ns):
@@ -612,15 +830,13 @@ def _extract_pdf_text(raw):
             from PyPDF2 import PdfReader
             reader_cls = PdfReader
         except Exception:
-            raise ValueError('PDF-файлы требуют установленный пакет pypdf или PyPDF2 на сервере')
+            raise ValueError("PDF-файлы требуют установленный пакет pypdf на сервере")
     try:
         reader = reader_cls(io.BytesIO(raw))
-        pages = []
-        for page in reader.pages[:20]:
-            pages.append(page.extract_text() or '')
+        pages = [page.extract_text() or '' for page in reader.pages[:20]]
         return '\n\n'.join(pages).strip()
     except Exception:
-        raise ValueError('Не удалось извлечь текст из PDF')
+        raise ValueError("Не удалось извлечь текст из PDF")
 
 
 def extract_uploaded_file_text(file_obj):
@@ -628,18 +844,15 @@ def extract_uploaded_file_text(file_obj):
     if not file_obj:
         return ''
     if not isinstance(file_obj, dict):
-        raise ValueError('Некорректный файл')
-
+        raise ValueError("Некорректный файл")
     name = str(file_obj.get('name') or 'file')
     data_url = file_obj.get('data') or ''
     size = int(file_obj.get('size') or 0)
     if size and size > 8 * 1024 * 1024:
-        raise ValueError('Файл слишком большой. Максимум 8 МБ')
-
+        raise ValueError("Файл слишком большой. Максимум 8 МБ")
     mime, raw = _decode_data_url(data_url)
     if len(raw) > 8 * 1024 * 1024:
-        raise ValueError('Файл слишком большой. Максимум 8 МБ')
-
+        raise ValueError("Файл слишком большой. Максимум 8 МБ")
     lower = name.lower()
     if lower.endswith(('.txt', '.md', '.csv')) or mime.startswith('text/'):
         for enc in ('utf-8-sig', 'utf-8', 'cp1251'):
@@ -647,15 +860,13 @@ def extract_uploaded_file_text(file_obj):
                 return raw.decode(enc).strip()
             except Exception:
                 pass
-        raise ValueError('Не удалось распознать кодировку текстового файла')
-
+        raise ValueError("Не удалось распознать кодировку текстового файла")
     if lower.endswith('.docx') or mime == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
         return _extract_docx_text(raw)
-
     if lower.endswith('.pdf') or mime == 'application/pdf':
         return _extract_pdf_text(raw)
+    raise ValueError("Поддерживаются только TXT, MD, CSV, DOCX и PDF")
 
-    raise ValueError('Поддерживаются только TXT, MD, CSV, DOCX и PDF')
 
 async def handle_proxy(request):
     if request.method == "OPTIONS":
@@ -669,7 +880,6 @@ async def handle_proxy(request):
     work_type = body.get("type", "")
     text = (body.get("text") or "").strip()
 
-    # Новый формат: photos = [base64, base64]. Старый формат photo тоже поддерживаем.
     photos = body.get("photos") or []
     old_photo = body.get("photo")
     if old_photo:
@@ -682,7 +892,6 @@ async def handle_proxy(request):
     if not prompt:
         return web.json_response({"error": "unknown_type"}, status=400, headers=CORS_HEADERS)
 
-    # Проверяем и сразу сжигаем токен, чтобы один токен нельзя было использовать для нескольких проверок
     user_id = consume_token(token)
     if not user_id:
         return web.json_response({"error": "invalid_token"}, status=403, headers=CORS_HEADERS)
@@ -703,44 +912,63 @@ async def handle_proxy(request):
     if not combined_text.strip() and not photos:
         return web.json_response({"error": "empty_work"}, status=400, headers=CORS_HEADERS)
 
-    # Ограничиваем размер текста, чтобы не улететь в слишком большой запрос
     if len(combined_text) > 60000:
         combined_text = combined_text[:60000] + "\n\n[Текст был обрезан до 60000 символов.]"
 
-    # Формируем сообщение для xAI
     if photos:
-        user_content = []
-        for photo in photos:
-            user_content.append({"type": "image_url", "image_url": {"url": photo}})
-        user_content.append({"type": "text", "text": "Вот фото/файл задания и текст работы.\n\n" + prompt + combined_text})
+        user_content = [{"type": "image_url", "image_url": {"url": p}} for p in photos]
+        user_content.append({
+            "type": "text",
+            "text": "Вот фото/файл задания и текст работы.\n\n" + prompt + combined_text
+        })
     else:
         user_content = prompt + combined_text
 
-    import aiohttp as aiohttp_client
     try:
         async with xai_semaphore:
-            async with aiohttp_client.ClientSession() as session:
+            async with aiohttp.ClientSession() as session:
                 async with session.post(
                     "https://api.x.ai/v1/chat/completions",
-                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {GROK_API_KEY}"},
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {GROK_API_KEY}"
+                    },
                     json={
-                        "model": "grok-4.20-0309-reasoning",
+                        "model": XAI_MODEL,
                         "messages": [
-                            {"role": "system", "content": "Ты опытный преподаватель, проверяющий работы по ЕГЭ. Отвечай структурированно и по делу."},
+                            {
+                                "role": "system",
+                                "content": "Ты опытный преподаватель, проверяющий работы по ЕГЭ. Отвечай структурированно и по делу."
+                            },
                             {"role": "user", "content": user_content}
                         ]
                     },
-                    timeout=aiohttp_client.ClientTimeout(total=300)
+                    timeout=aiohttp.ClientTimeout(total=300)
                 ) as resp:
                     if resp.status != 200:
                         err = await resp.text()
-                        return web.json_response({"error": f"xAI error: {err[:200]}"}, status=502, headers=CORS_HEADERS)
+                        return web.json_response(
+                            {"error": f"xAI error: {err[:200]}"}, status=502, headers=CORS_HEADERS
+                        )
                     data = await resp.json()
-                    answer = data["choices"][0]["message"]["content"]
+                    choices = data.get("choices")
+                    if not choices or not isinstance(choices, list):
+                        return web.json_response(
+                            {"error": "xAI вернул пустой ответ"}, status=502, headers=CORS_HEADERS
+                        )
+                    answer = choices[0].get("message", {}).get("content", "")
+                    if not answer:
+                        return web.json_response(
+                            {"error": "xAI вернул пустой ответ"}, status=502, headers=CORS_HEADERS
+                        )
                     save_history(user_id, work_type, answer)
+                    asyncio.create_task(_send_new_token(user_id))
                     return web.json_response({"answer": answer}, headers=CORS_HEADERS)
+    except asyncio.TimeoutError:
+        return web.json_response({"error": "Таймаут ответа от ИИ"}, status=504, headers=CORS_HEADERS)
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500, headers=CORS_HEADERS)
+
 
 async def handle_yukassa_webhook(request):
     try:
@@ -749,9 +977,13 @@ async def handle_yukassa_webhook(request):
         return web.Response(status=400)
     if body.get("event") != "payment.succeeded":
         return web.Response(status=200)
-    meta    = body.get("object", {}).get("metadata", {})
-    user_id = int(meta.get("user_id", 0))
-    pl      = meta.get("payload", "")
+    obj = body.get("object", {})
+    meta = obj.get("metadata", {})
+    try:
+        user_id = int(meta.get("user_id", 0))
+    except (ValueError, TypeError):
+        return web.Response(status=200)
+    pl = meta.get("payload", "")
     if not user_id or not pl:
         return web.Response(status=200)
     from telegram import Bot
@@ -759,43 +991,60 @@ async def handle_yukassa_webhook(request):
     referrer_id = reward_referrer(user_id)
     if referrer_id:
         try:
-            await bot.send_message(chat_id=referrer_id, text="🎉 Твой друг купил проверку! Тебе начислена 1 бесплатная проверка.\n\nПроверь баланс → /balance")
+            await bot.send_message(
+                chat_id=referrer_id,
+                text="🎉 Твой друг купил проверку! Тебе начислена 1 бесплатная проверка.\n\nПроверь баланс → /balance"
+            )
         except Exception:
             pass
     if pl == "rub_month":
         add_subscription(user_id, 30)
         token = create_token(user_id)
-        await bot.send_message(chat_id=user_id, text="✅ Оплата прошла! Безлимит на 30 дней активирован. Нажми кнопку 👇", reply_markup=webapp_keyboard(token))
+        await bot.send_message(
+            chat_id=user_id,
+            text="✅ Оплата прошла! Безлимит на 30 дней активирован. Нажми кнопку 👇",
+            reply_markup=webapp_keyboard(token)
+        )
     else:
         count = 5 if pl == "rub_5" else 1
         add_paid_checks(user_id, count)
         token = create_token(user_id)
         use_paid_check(user_id)
-        remaining = get_user(user_id)["paid_checks"] - 1
-        await bot.send_message(chat_id=user_id, text="✅ Оплата прошла! Куплено " + str(count) + " пр. Осталось: " + str(remaining) + " Нажми кнопку 👇", reply_markup=webapp_keyboard(token))
+        remaining = get_user(user_id)["paid_checks"]
+        await bot.send_message(
+            chat_id=user_id,
+            text=f"✅ Оплата прошла! Куплено {count} пр. Осталось: {remaining}\nНажми кнопку 👇",
+            reply_markup=webapp_keyboard(token)
+        )
     return web.Response(status=200)
+
 
 async def run_web():
     app = web.Application()
-    app.router.add_get("/check_token", handle_check_token)
+    app.router.add_get("/check_token",        handle_check_token)
     app.router.add_route("OPTIONS", "/check_token", handle_check_token)
-    app.router.add_post("/proxy", handle_proxy)
+    app.router.add_post("/ocr",               handle_ocr)
+    app.router.add_route("OPTIONS", "/ocr",   handle_ocr)
+    app.router.add_post("/proxy",             handle_proxy)
     app.router.add_route("OPTIONS", "/proxy", handle_proxy)
-    app.router.add_post("/yukassa/webhook", handle_yukassa_webhook)
+    app.router.add_post("/yukassa/webhook",   handle_yukassa_webhook)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
     print(f"Web server started on port {PORT}")
 
+
 async def main():
     init_db()
     await run_web()
+    if ENABLE_KEEPALIVE:
+        asyncio.create_task(_keepalive_loop())
     tg_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    tg_app.add_handler(CommandHandler("start", start))
-    tg_app.add_handler(CommandHandler("buy", buy))
+    tg_app.add_handler(CommandHandler("start",   start))
+    tg_app.add_handler(CommandHandler("buy",     buy))
     tg_app.add_handler(CommandHandler("balance", balance))
-    tg_app.add_handler(CommandHandler("ref", ref))
-    tg_app.add_handler(CommandHandler("help", help_cmd))
+    tg_app.add_handler(CommandHandler("ref",     ref))
+    tg_app.add_handler(CommandHandler("help",    help_cmd))
     tg_app.add_handler(CommandHandler("history", history_cmd))
     tg_app.add_handler(CallbackQueryHandler(handle_callback))
     tg_app.add_handler(PreCheckoutQueryHandler(pre_checkout))
@@ -804,5 +1053,6 @@ async def main():
         await tg_app.start()
         await tg_app.updater.start_polling()
         await asyncio.Event().wait()
+
 
 asyncio.run(main())
